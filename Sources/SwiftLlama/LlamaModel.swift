@@ -56,15 +56,10 @@ class LlamaModel {
         llama_sampler_chain_add(
             sampler,
             llama_sampler_init_penalties(
-                llama_n_vocab(model),
-                llama_token_eos(model),
-                llama_token_nl(model),
                 Int32(configuration.penaltyLastN),
                 configuration.repetitionPenalty,
                 configuration.frequencyPenalty,
-                configuration.presencePenalty,
-                configuration.penalizeNewline,
-                configuration.ignoreEos
+                configuration.presencePenalty
             )
         )
         let minKeep = max(0, configuration.minKeep)
@@ -80,7 +75,6 @@ class LlamaModel {
                 llama_sampler_chain_add(sampler, llama_sampler_init_min_p(configuration.minP, minKeep))
             }
             llama_sampler_chain_add(sampler, llama_sampler_init_temp(configuration.temperature))
-            llama_sampler_chain_add(sampler, llama_sampler_init_softmax())
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(Self.resolveSeed(configuration.seed)))
         } else {
             llama_sampler_chain_add(sampler, llama_sampler_init_greedy())
