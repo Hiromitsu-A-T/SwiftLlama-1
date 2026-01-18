@@ -14,20 +14,17 @@ let package = Package(
     products: [
         .library(name: "SwiftLlama", targets: ["SwiftLlama"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/ggerganov/llama.cpp.git", revision: "b6d6c5289f1c9c677657c380591201ddb210b649")
-    ],
+    dependencies: [],
     targets: [
         .target(name: "SwiftLlama", 
                 dependencies: [
-                    "LlamaFramework",
-                    .product(name: "llama", package: "llama.cpp")
+                    "LlamaFramework"
                 ]),
         .testTarget(name: "SwiftLlamaTests", dependencies: ["SwiftLlama"]),
         .binaryTarget(
             name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b7769/llama-b7769-xcframework.zip",
+            checksum: "ac3928d30d22731b90c885f85d4288ac441fe2139e134b04c821c5657256a3e5"
         )
     ]
 )

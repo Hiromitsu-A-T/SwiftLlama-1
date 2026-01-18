@@ -52,7 +52,10 @@ public class SwiftLlama {
         }
     }
 
-    private func response(for prompt: Prompt, output: (String) -> Void, finish: () -> Void) {
+    private func response(for prompt: Prompt,
+                          maxOutputTokens: Int?,
+                          output: (String) -> Void,
+                          finish: () -> Void) {
         func finaliseOutput() {
             configuration.stopTokens.forEach {
                 generatedTokenCache = generatedTokenCache.replacingOccurrences(of: $0, with: "")
@@ -63,8 +66,11 @@ public class SwiftLlama {
         }
         defer { model.clear() }
         do {
-            try model.start(for: prompt)
+            try model.start(for: prompt, maxOutputTokens: maxOutputTokens)
             while model.shouldContinue {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
                 var delta = try model.continue()
                 if contentStarted { // remove the prefix empty spaces
                     if needToStop(after: delta, output: output) {
@@ -122,11 +128,13 @@ public class SwiftLlama {
     }
 
     @SwiftLlamaActor
-    public func start(for prompt: Prompt, sessionSupport: Bool = false) -> AsyncThrowingStream<String, Error> {
+    public func start(for prompt: Prompt,
+                      sessionSupport: Bool = false,
+                      maxOutputTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
         return .init { continuation in
             Task {
-                response(for: sessionPrompt) { [weak self] delta in
+                response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { [weak self] delta in
                     continuation.yield(delta)
                     self?.session?.response(delta: delta)
                 } finish: { [weak self] in
@@ -138,10 +146,12 @@ public class SwiftLlama {
     }
 
     @SwiftLlamaActor
-    public func start(for prompt: Prompt, sessionSupport: Bool = false) -> AnyPublisher<String, Error> {
+    public func start(for prompt: Prompt,
+                      sessionSupport: Bool = false,
+                      maxOutputTokens: Int? = nil) -> AnyPublisher<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
         Task {
-            response(for: sessionPrompt) { delta in
+            response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { delta in
                 resultSubject.send(delta)
                 session?.response(delta: delta)
             } finish: {
@@ -153,9 +163,11 @@ public class SwiftLlama {
     }
 
     @SwiftLlamaActor
-    public func start(for prompt: Prompt, sessionSupport: Bool = false) async throws -> String {
+    public func start(for prompt: Prompt,
+                      sessionSupport: Bool = false,
+                      maxOutputTokens: Int? = nil) async throws -> String {
         var result = ""
-        for try await value in start(for: prompt) {
+        for try await value in start(for: prompt, sessionSupport: sessionSupport, maxOutputTokens: maxOutputTokens) {
             result += value
         }
         return result

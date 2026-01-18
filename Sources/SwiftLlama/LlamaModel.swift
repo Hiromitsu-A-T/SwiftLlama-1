@@ -4,20 +4,29 @@ import llama
 class LlamaModel {
     private let model: Model
     private let configuration: Configuration
-    private let context: OpaquePointer
+    private let context: Context
+    private let vocab: Vocab
     private let sampler: UnsafeMutablePointer<llama_sampler>
     private var batch: Batch
     private var tokens: [Token]
+    private var maxTokenCountOverride: Int32?
+    private var promptTokenCount: Int32 = 0
     private var generatedTokenAccount: Int32 = 0
     private var ended = false
-    private let n_len: Int32 = 1024
 
     var shouldContinue: Bool {
-        generatedTokenAccount < configuration.maxTokenCount && !ended
+        generatedTokenAccount < effectiveMaxTokenCount && !ended
+    }
+
+    private var effectiveMaxTokenCount: Int32 {
+        maxTokenCountOverride ?? Int32(configuration.maxTokenCount)
     }
 
     init(path: String, configuration: Configuration = .init()) throws {
         self.configuration = configuration
+        if Self.shouldEnableLogging() {
+            Self.installLogCallbackIfNeeded()
+        }
         llama_backend_init()
         llama_numa_init(GGML_NUMA_STRATEGY_DISABLED)
 
@@ -26,22 +35,25 @@ class LlamaModel {
         model_params.n_gpu_layers = 0
         #endif
 
-        guard let model = llama_load_model_from_file(path, model_params) else {
+        guard let model = llama_model_load_from_file(path, model_params) else {
             throw SwiftLlamaError.others("Cannot load model at path \(path)")
         }
         self.model = model
 
-        guard let context = llama_new_context_with_model(model, configuration.contextParameters) else {
+        guard let context = llama_init_from_model(model, configuration.contextParameters) else {
             throw SwiftLlamaError.others("Cannot load model context")
         }
         self.context = context
+        guard let vocab = llama_model_get_vocab(model) else {
+            throw SwiftLlamaError.others("Cannot load model vocabulary")
+        }
+        self.vocab = vocab
 
         self.tokens = []
         self.batch = llama_batch_init(Int32(configuration.batchSize * Configuration.historySize * 2), 0, 1)
 
         self.sampler = llama_sampler_chain_init(llama_sampler_chain_default_params())
         llama_sampler_chain_add(sampler, llama_sampler_init_temp(configuration.temperature))
-        llama_sampler_chain_add(sampler, llama_sampler_init_softmax())
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(1234))
 
         try checkContextLength(context: context, model: model)
@@ -49,15 +61,24 @@ class LlamaModel {
 
     private func checkContextLength(context: Context, model: Model) throws {
         let n_ctx = llama_n_ctx(context)
-        let n_ctx_train = llama_n_ctx_train(model)
+        let n_ctx_train = llama_model_n_ctx_train(model)
         if n_ctx > n_ctx_train {
             throw SwiftLlamaError.others("Model was trained on \(n_ctx_train) context but tokens \(n_ctx) specified")
         }
     }
 
-    func start(for prompt: Prompt) throws {
+    func start(for prompt: Prompt, maxOutputTokens: Int?) throws {
         ended = false
         tokens = tokenize(text: prompt.prompt, addBos: true)
+        promptTokenCount = Int32(tokens.count)
+        if let maxOutputTokens {
+            let output = max(1, maxOutputTokens)
+            let total = promptTokenCount + Int32(output)
+            let contextLimit = Int32(llama_n_ctx(context))
+            maxTokenCountOverride = min(total, contextLimit)
+        } else {
+            maxTokenCountOverride = nil
+        }
 
         batch.clear()
         tokens.enumerated().forEach { index, token in
@@ -74,7 +95,7 @@ class LlamaModel {
     func `continue`() throws -> String {
         let newToken = llama_sampler_sample(sampler, context, batch.n_tokens - 1)
 
-        if llama_token_is_eog(model, newToken) || generatedTokenAccount == n_len {
+        if llama_vocab_is_eog(vocab, newToken) || generatedTokenAccount >= effectiveMaxTokenCount {
             ended = true
             return ""
         }
@@ -101,8 +122,7 @@ class LlamaModel {
         // First attempt
         var written = buf.withUnsafeMutableBufferPointer { p -> Int32 in
             guard let base = p.baseAddress else { return 0 }
-            // Use the signature your llama module exposes (this matches your previous use: 6 args)
-            return llama_token_to_piece(model, token, base, cap, 0, false)
+            return llama_token_to_piece(vocab, token, base, cap, 0, false)
         }
 
         // If negative, allocate required size and retry
@@ -111,7 +131,7 @@ class LlamaModel {
             buf = [CChar](repeating: 0, count: Int(cap))
             written = buf.withUnsafeMutableBufferPointer { p -> Int32 in
                 guard let base = p.baseAddress else { return 0 }
-                return llama_token_to_piece(model, token, base, cap, 0, false)
+                return llama_token_to_piece(vocab, token, base, cap, 0, false)
             }
         }
 
@@ -125,24 +145,53 @@ class LlamaModel {
 
     private func tokenize(text: String, addBos: Bool) -> [Token] {
         let utf8Count = text.utf8.count
-        let n_tokens = utf8Count + (addBos ? 1 : 0) + 1
+        let initial = utf8Count + (addBos ? 1 : 0) + 1
 
-        return Array(unsafeUninitializedCapacity: n_tokens) { buffer, initializedCount in
-            initializedCount = Int(
-                llama_tokenize(model, text, Int32(utf8Count), buffer.baseAddress, Int32(n_tokens), addBos, false)
-            )
+        func tokenize(into capacity: Int) -> (Int32, [Token]) {
+            var buffer = [Token](repeating: 0, count: max(1, capacity))
+            let count = llama_tokenize(vocab, text, Int32(utf8Count), &buffer, Int32(buffer.count), addBos, false)
+            return (count, buffer)
         }
+
+        var (count, buffer) = tokenize(into: initial)
+        if count < 0 {
+            (count, buffer) = tokenize(into: Int(-count))
+        }
+        let resolved = max(0, Int(count))
+        return Array(buffer.prefix(resolved))
     }
 
     func clear() {
         tokens.removeAll()
-        llama_kv_cache_clear(context)
+        let memory = llama_get_memory(context)
+        llama_memory_clear(memory, true)
+        maxTokenCountOverride = nil
+        promptTokenCount = 0
     }
 
     deinit {
         llama_batch_free(batch)
         llama_free(context)
-        llama_free_model(model)
+        llama_model_free(model)
         llama_backend_free()
+    }
+
+    nonisolated(unsafe) private static var didInstallLogCallback = false
+    private static let logCallback: ggml_log_callback = { _, text, _ in
+        guard let text else { return }
+        let message = String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        fputs("[LLM][llama] \(message)\n", stderr)
+    }
+
+    private static func shouldEnableLogging() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["LLM_LLAMA_LOG"] == "1" || env["LLM_BENCH_TRANSLATE"] == "1"
+    }
+
+    private static func installLogCallbackIfNeeded() {
+        guard !didInstallLogCallback else { return }
+        llama_log_set(logCallback, nil)
+        didInstallLogCallback = true
     }
 }
