@@ -53,8 +53,38 @@ class LlamaModel {
         self.batch = llama_batch_init(Int32(configuration.batchSize * Configuration.historySize * 2), 0, 1)
 
         self.sampler = llama_sampler_chain_init(llama_sampler_chain_default_params())
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(configuration.temperature))
-        llama_sampler_chain_add(sampler, llama_sampler_init_dist(1234))
+        llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_penalties(
+                llama_n_vocab(model),
+                llama_token_eos(model),
+                llama_token_nl(model),
+                Int32(configuration.penaltyLastN),
+                configuration.repetitionPenalty,
+                configuration.frequencyPenalty,
+                configuration.presencePenalty,
+                configuration.penalizeNewline,
+                configuration.ignoreEos
+            )
+        )
+        let minKeep = max(0, configuration.minKeep)
+        let shouldApplyTopP = configuration.topP > 0 && (configuration.topP < 1.0 || minKeep > 0)
+        if configuration.temperature > 0 {
+            if configuration.topK > 0 {
+                llama_sampler_chain_add(sampler, llama_sampler_init_top_k(Int32(configuration.topK)))
+            }
+            if shouldApplyTopP {
+                llama_sampler_chain_add(sampler, llama_sampler_init_top_p(configuration.topP, minKeep))
+            }
+            if configuration.minP > 0 {
+                llama_sampler_chain_add(sampler, llama_sampler_init_min_p(configuration.minP, minKeep))
+            }
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(configuration.temperature))
+            llama_sampler_chain_add(sampler, llama_sampler_init_softmax())
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(Self.resolveSeed(configuration.seed)))
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy())
+        }
 
         try checkContextLength(context: context, model: model)
     }
@@ -69,6 +99,7 @@ class LlamaModel {
 
     func start(for prompt: Prompt, maxOutputTokens: Int?) throws {
         ended = false
+        llama_sampler_reset(sampler)
         tokens = tokenize(text: prompt.prompt, addBos: true)
         promptTokenCount = Int32(tokens.count)
         if let maxOutputTokens {
@@ -193,5 +224,12 @@ class LlamaModel {
         guard !didInstallLogCallback else { return }
         llama_log_set(logCallback, nil)
         didInstallLogCallback = true
+    }
+
+    private static func resolveSeed(_ seed: Int) -> UInt32 {
+        if seed < 0 {
+            return UInt32(LLAMA_DEFAULT_SEED)
+        }
+        return UInt32(clamping: seed)
     }
 }
