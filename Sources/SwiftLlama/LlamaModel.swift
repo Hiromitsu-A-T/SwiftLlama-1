@@ -2,6 +2,33 @@ import Foundation
 import llama
 
 class LlamaModel {
+    private enum LlamaBackend {
+        private static let lock = NSLock()
+        private nonisolated(unsafe) static var refCount = 0
+        private nonisolated(unsafe) static var isInitialized = false
+
+        static func retain() {
+            lock.lock()
+            if !isInitialized {
+                llama_backend_init()
+                llama_numa_init(GGML_NUMA_STRATEGY_DISABLED)
+                isInitialized = true
+            }
+            refCount += 1
+            lock.unlock()
+        }
+
+        static func release() {
+            lock.lock()
+            refCount = max(0, refCount - 1)
+            let shouldFree = refCount == 0
+            lock.unlock()
+            if shouldFree {
+                llama_backend_free()
+            }
+        }
+    }
+
     private let model: Model
     private let configuration: Configuration
     private let context: Context
@@ -27,8 +54,13 @@ class LlamaModel {
         if Self.shouldEnableLogging() {
             Self.installLogCallbackIfNeeded()
         }
-        llama_backend_init()
-        llama_numa_init(GGML_NUMA_STRATEGY_DISABLED)
+        LlamaBackend.retain()
+        var initialized = false
+        defer {
+            if !initialized {
+                LlamaBackend.release()
+            }
+        }
 
         var model_params = llama_model_default_params()
         #if targetEnvironment(simulator)
@@ -81,6 +113,7 @@ class LlamaModel {
         }
 
         try checkContextLength(context: context, model: model)
+        initialized = true
     }
 
     private func checkContextLength(context: Context, model: Model) throws {
@@ -198,7 +231,7 @@ class LlamaModel {
         llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)
-        llama_backend_free()
+        LlamaBackend.release()
     }
 
     nonisolated(unsafe) private static var didInstallLogCallback = false

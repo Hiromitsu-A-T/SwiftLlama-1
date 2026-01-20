@@ -133,7 +133,7 @@ public class SwiftLlama {
                       maxOutputTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
         return .init { continuation in
-            Task {
+            Task { @SwiftLlamaActor in
                 response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { [weak self] delta in
                     continuation.yield(delta)
                     self?.session?.response(delta: delta)
@@ -150,7 +150,7 @@ public class SwiftLlama {
                       sessionSupport: Bool = false,
                       maxOutputTokens: Int? = nil) -> AnyPublisher<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
-        Task {
+        Task { @SwiftLlamaActor in
             response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { delta in
                 resultSubject.send(delta)
                 session?.response(delta: delta)
