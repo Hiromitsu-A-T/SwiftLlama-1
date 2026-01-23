@@ -36,10 +36,7 @@ and the purpose of this repo is to provide a swiftier API for Swift developers.
 
 ## Test projects
 
-[This video](https://youtu.be/w1VEM00cJWo) was the command line app running with Llama 3 model.
-
-For using it in iOS or MacOS app, please refer to the [TestProjects](https://github.com/ShenghaiWang/SwiftLlama/tree/main/TestProjects) folder.
-
+Example apps are available in the upstream SwiftLlama repository.
 
 ## Supported Models
 
@@ -48,6 +45,5 @@ In theory, it should support all the models that llama.cpp suports. However, the
 If you want to test it out quickly, please use this model [codellama-7b-instruct.Q4_K_S.gguf](https://huggingface.co/TheBloke/CodeLlama-7B-Instruct-GGUF/resolve/main/codellama-7b-instruct.Q4_K_S.gguf?download=true)
 
 ## Welcome to contribute!!!
-
 
 
