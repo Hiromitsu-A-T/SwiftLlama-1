@@ -244,7 +244,7 @@ class LlamaModel {
 
     private static func shouldEnableLogging() -> Bool {
         let env = ProcessInfo.processInfo.environment
-        return env["LLM_LLAMA_LOG"] == "1" || env["LLM_BENCH_TRANSLATE"] == "1"
+        return env["LLM_LLAMA_LOG"] == "1"
     }
 
     private static func installLogCallbackIfNeeded() {
