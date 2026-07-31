@@ -1,31 +1,67 @@
 import Foundation
 import llama
 
+final class LlamaBackendLifecycle: @unchecked Sendable {
+    struct Snapshot: Equatable {
+        let referenceCount: Int
+        let isInitialized: Bool
+    }
+
+    private let lock = NSLock()
+    private var referenceCount = 0
+    private var isInitialized = false
+    private let initialize: () -> Void
+    private let shutdown: () -> Void
+
+    init(initialize: @escaping () -> Void, shutdown: @escaping () -> Void) {
+        self.initialize = initialize
+        self.shutdown = shutdown
+    }
+
+    func retain() {
+        lock.lock()
+        defer { lock.unlock() }
+        if !isInitialized {
+            initialize()
+            isInitialized = true
+        }
+        referenceCount += 1
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard referenceCount > 0 else { return }
+        referenceCount -= 1
+        if referenceCount == 0, isInitialized {
+            shutdown()
+            isInitialized = false
+        }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(referenceCount: referenceCount, isInitialized: isInitialized)
+    }
+}
+
 class LlamaModel {
     private enum LlamaBackend {
-        private static let lock = NSLock()
-        private nonisolated(unsafe) static var refCount = 0
-        private nonisolated(unsafe) static var isInitialized = false
-
-        static func retain() {
-            lock.lock()
-            if !isInitialized {
+        private static let lifecycle = LlamaBackendLifecycle(
+            initialize: {
                 llama_backend_init()
                 llama_numa_init(GGML_NUMA_STRATEGY_DISABLED)
-                isInitialized = true
-            }
-            refCount += 1
-            lock.unlock()
+            },
+            shutdown: llama_backend_free
+        )
+
+        static func retain() {
+            lifecycle.retain()
         }
 
         static func release() {
-            lock.lock()
-            refCount = max(0, refCount - 1)
-            let shouldFree = refCount == 0
-            lock.unlock()
-            if shouldFree {
-                llama_backend_free()
-            }
+            lifecycle.release()
         }
     }
 
@@ -56,25 +92,37 @@ class LlamaModel {
         }
         LlamaBackend.retain()
         var initialized = false
+        var modelToFree: Model?
+        var contextToFree: Context?
+        var batchToFree: Batch?
+        var samplerToFree: UnsafeMutablePointer<llama_sampler>?
         defer {
             if !initialized {
+                Self.releaseFailedInitialization(
+                    model: modelToFree,
+                    context: contextToFree,
+                    batch: batchToFree,
+                    sampler: samplerToFree
+                )
                 LlamaBackend.release()
             }
         }
 
-        var model_params = llama_model_default_params()
+        var modelParameters = llama_model_default_params()
         #if targetEnvironment(simulator)
-        model_params.n_gpu_layers = 0
+        modelParameters.n_gpu_layers = 0
         #endif
 
-        guard let model = llama_model_load_from_file(path, model_params) else {
+        guard let model = llama_model_load_from_file(path, modelParameters) else {
             throw SwiftLlamaError.others("Cannot load model at path \(path)")
         }
+        modelToFree = model
         self.model = model
 
         guard let context = llama_init_from_model(model, configuration.contextParameters) else {
             throw SwiftLlamaError.others("Cannot load model context")
         }
+        contextToFree = context
         self.context = context
         guard let vocab = llama_model_get_vocab(model) else {
             throw SwiftLlamaError.others("Cannot load model vocabulary")
@@ -82,9 +130,24 @@ class LlamaModel {
         self.vocab = vocab
 
         self.tokens = []
-        self.batch = llama_batch_init(Int32(configuration.batchSize * Configuration.historySize * 2), 0, 1)
+        let batch = llama_batch_init(Int32(configuration.batchSize * Configuration.historySize * 2), 0, 1)
+        batchToFree = batch
+        self.batch = batch
 
-        self.sampler = llama_sampler_chain_init(llama_sampler_chain_default_params())
+        let sampler = try Self.makeSampler(configuration: configuration)
+        samplerToFree = sampler
+        self.sampler = sampler
+
+        try checkContextLength(context: context, model: model)
+        initialized = true
+    }
+
+    private static func makeSampler(
+        configuration: Configuration
+    ) throws -> UnsafeMutablePointer<llama_sampler> {
+        guard let sampler = llama_sampler_chain_init(llama_sampler_chain_default_params()) else {
+            throw SwiftLlamaError.others("Cannot initialize model sampler")
+        }
         llama_sampler_chain_add(
             sampler,
             llama_sampler_init_penalties(
@@ -111,16 +174,36 @@ class LlamaModel {
         } else {
             llama_sampler_chain_add(sampler, llama_sampler_init_greedy())
         }
+        return sampler
+    }
 
-        try checkContextLength(context: context, model: model)
-        initialized = true
+    private static func releaseFailedInitialization(
+        model: Model?,
+        context: Context?,
+        batch: Batch?,
+        sampler: UnsafeMutablePointer<llama_sampler>?
+    ) {
+        if let sampler {
+            llama_sampler_free(sampler)
+        }
+        if let batch {
+            llama_batch_free(batch)
+        }
+        if let context {
+            llama_free(context)
+        }
+        if let model {
+            llama_model_free(model)
+        }
     }
 
     private func checkContextLength(context: Context, model: Model) throws {
-        let n_ctx = llama_n_ctx(context)
-        let n_ctx_train = llama_model_n_ctx_train(model)
-        if n_ctx > n_ctx_train {
-            throw SwiftLlamaError.others("Model was trained on \(n_ctx_train) context but tokens \(n_ctx) specified")
+        let contextLength = llama_n_ctx(context)
+        let trainingContextLength = llama_model_n_ctx_train(model)
+        if contextLength > trainingContextLength {
+            throw SwiftLlamaError.others(
+                "Model was trained on \(trainingContextLength) context but tokens \(contextLength) specified"
+            )
         }
     }
 
@@ -178,8 +261,8 @@ class LlamaModel {
         var buf = [CChar](repeating: 0, count: Int(cap))
 
         // First attempt
-        var written = buf.withUnsafeMutableBufferPointer { p -> Int32 in
-            guard let base = p.baseAddress else { return 0 }
+        var written = buf.withUnsafeMutableBufferPointer { bufferPointer -> Int32 in
+            guard let base = bufferPointer.baseAddress else { return 0 }
             return llama_token_to_piece(vocab, token, base, cap, 0, false)
         }
 
@@ -187,8 +270,8 @@ class LlamaModel {
         if written < 0 {
             cap = -written
             buf = [CChar](repeating: 0, count: Int(cap))
-            written = buf.withUnsafeMutableBufferPointer { p -> Int32 in
-                guard let base = p.baseAddress else { return 0 }
+            written = buf.withUnsafeMutableBufferPointer { bufferPointer -> Int32 in
+                guard let base = bufferPointer.baseAddress else { return 0 }
                 return llama_token_to_piece(vocab, token, base, cap, 0, false)
             }
         }
@@ -198,6 +281,8 @@ class LlamaModel {
 
         // Decode exact byte count (no trailing NUL included)
         let bytes: [UInt8] = buf.prefix(count).map { UInt8(bitPattern: $0) }
+        // Token pieces can contain partial UTF-8, so loss-tolerant decoding is intentional here.
+        // swiftlint:disable:next optional_data_string_conversion
         return String(decoding: bytes, as: UTF8.self)
     }
 
@@ -228,6 +313,7 @@ class LlamaModel {
     }
 
     deinit {
+        llama_sampler_free(sampler)
         llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)

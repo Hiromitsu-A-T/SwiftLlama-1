@@ -15,17 +15,16 @@ public class SwiftLlama {
     }
 
     private var session: Session?
-    private lazy var resultSubject: CurrentValueSubject<String, Error> = {
-        .init("")
-    }()
     private var generatedTokenCache = ""
 
     var maxLengthOfStopToken: Int {
         configuration.stopTokens.map { $0.count }.max() ?? 0
     }
 
-    public init(modelPath: String,
-                 modelConfiguration: Configuration = .init()) throws {
+    public init(
+        modelPath: String,
+        modelConfiguration: Configuration = .init()
+    ) throws {
         self.model = try LlamaModel(path: modelPath, configuration: modelConfiguration)
         self.configuration = modelConfiguration
     }
@@ -46,22 +45,17 @@ public class SwiftLlama {
         }
     }
 
-    private func isStopToken() -> Bool {
-        configuration.stopTokens.reduce(false) { partialResult, stopToken in
-            generatedTokenCache.hasSuffix(stopToken)
-        }
-    }
-
     private func response(for prompt: Prompt,
                           maxOutputTokens: Int?,
                           output: (String) -> Void,
-                          finish: () -> Void) {
-        func finaliseOutput() {
+                          finish: (Error?) -> Void) {
+        func flushBufferedOutput() {
             configuration.stopTokens.forEach {
                 generatedTokenCache = generatedTokenCache.replacingOccurrences(of: $0, with: "")
             }
-            output(generatedTokenCache)
-            finish()
+            if !generatedTokenCache.isEmpty {
+                output(generatedTokenCache)
+            }
             generatedTokenCache = ""
         }
         defer { model.clear() }
@@ -74,7 +68,6 @@ public class SwiftLlama {
                 var delta = try model.continue()
                 if contentStarted { // remove the prefix empty spaces
                     if needToStop(after: delta, output: output) {
-                        finish()
                         break
                     }
                 } else {
@@ -82,15 +75,16 @@ public class SwiftLlama {
                     if !delta.isEmpty {
                         contentStarted = true
                         if needToStop(after: delta, output: output) {
-                            finish()
                             break
                         }
                     }
                 }
             }
-            finaliseOutput()
+            flushBufferedOutput()
+            finish(nil)
         } catch {
-            finaliseOutput()
+            flushBufferedOutput()
+            finish(error)
         }
     }
 
@@ -107,8 +101,7 @@ public class SwiftLlama {
         // 1) If any stop token appears, cut output before it and stop
         if let stopRange = configuration.stopTokens
             .compactMap({ generatedTokenCache.range(of: $0) })
-            .min(by: { $0.lowerBound < $1.lowerBound }) // earliest occurrence
-        {
+            .min(by: { $0.lowerBound < $1.lowerBound }) { // earliest occurrence
             let before = String(generatedTokenCache[..<stopRange.lowerBound])
             if !before.isEmpty { output(before) }
             generatedTokenCache.removeAll(keepingCapacity: false)
@@ -133,14 +126,22 @@ public class SwiftLlama {
                       maxOutputTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
         return .init { continuation in
-            Task { @SwiftLlamaActor in
+            let task = Task { @SwiftLlamaActor in
                 response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { [weak self] delta in
                     continuation.yield(delta)
                     self?.session?.response(delta: delta)
-                } finish: { [weak self] in
-                    continuation.finish()
-                    self?.session?.endResponse()
+                } finish: { [weak self] error in
+                    if let error {
+                        continuation.finish(throwing: error)
+                        self?.session = nil
+                    } else {
+                        continuation.finish()
+                        self?.session?.endResponse()
+                    }
                 }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -150,16 +151,24 @@ public class SwiftLlama {
                       sessionSupport: Bool = false,
                       maxOutputTokens: Int? = nil) -> AnyPublisher<String, Error> {
         let sessionPrompt = prepare(sessionSupport: sessionSupport, for: prompt)
-        Task { @SwiftLlamaActor in
+        let subject = PassthroughSubject<String, Error>()
+        let task = Task { @SwiftLlamaActor in
             response(for: sessionPrompt, maxOutputTokens: maxOutputTokens) { delta in
-                resultSubject.send(delta)
+                subject.send(delta)
                 session?.response(delta: delta)
-            } finish: {
-                resultSubject.send(completion: .finished)
-                session?.endResponse()
+            } finish: { error in
+                if let error {
+                    subject.send(completion: .failure(error))
+                    session = nil
+                } else {
+                    subject.send(completion: .finished)
+                    session?.endResponse()
+                }
             }
         }
-        return resultSubject.eraseToAnyPublisher()
+        return subject
+            .handleEvents(receiveCancel: { task.cancel() })
+            .eraseToAnyPublisher()
     }
 
     @SwiftLlamaActor
